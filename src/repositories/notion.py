@@ -12,30 +12,15 @@ from ..domain.models import (
     TaskSource,
     TaskFilter,
 )
+from ..config.settings import (
+    NotionPropertyNames,
+    NotionStatusMapping,
+    NotionPriorityMapping,
+)
 
 
 class NotionTaskRepository:
     """Repository for managing tasks in Notion database."""
-
-    # Notion API status mapping
-    STATUS_TO_NOTION = {
-        TaskStatus.TODO: "Not started",
-        TaskStatus.IN_PROGRESS: "In progress",
-        TaskStatus.DONE: "Done",
-        TaskStatus.BLOCKED: "Blocked",
-    }
-
-    NOTION_TO_STATUS = {v: k for k, v in STATUS_TO_NOTION.items()}
-
-    # Priority mapping
-    PRIORITY_TO_NOTION = {
-        TaskPriority.LOW: "Low",
-        TaskPriority.MEDIUM: "Medium",
-        TaskPriority.HIGH: "High",
-        TaskPriority.URGENT: "Urgent",
-    }
-
-    NOTION_TO_PRIORITY = {v: k for k, v in PRIORITY_TO_NOTION.items()}
 
     def __init__(
         self,
@@ -43,6 +28,10 @@ class NotionTaskRepository:
         database_id: str,
         *,
         source: TaskSource = TaskSource.NOTION_TEAM,
+        property_names: Optional[NotionPropertyNames] = None,
+        status_mapping: Optional[NotionStatusMapping] = None,
+        priority_mapping: Optional[NotionPriorityMapping] = None,
+        api_version: str = "2022-06-28",
         http_client: Optional[httpx.AsyncClient] = None,
     ):
         """Initialize Notion repository.
@@ -51,6 +40,10 @@ class NotionTaskRepository:
             api_key: Notion API key
             database_id: Notion database ID
             source: Task source type (NOTION_TEAM or NOTION_PERSONAL)
+            property_names: Notion property name mappings
+            status_mapping: Task status to Notion status value mappings
+            priority_mapping: Task priority to Notion priority value mappings
+            api_version: Notion API version
             http_client: Optional HTTP client for testing
         """
         self._api_key = api_key
@@ -59,12 +52,38 @@ class NotionTaskRepository:
         self._http_client = http_client
         self._owns_client = http_client is None
         self._base_url = "https://api.notion.com/v1"
+        self._api_version = api_version
+
+        # Use provided mappings or defaults
+        self._props = property_names or NotionPropertyNames()
+        self._status_map = status_mapping or NotionStatusMapping()
+        self._priority_map = priority_mapping or NotionPriorityMapping()
+
+        # Determine status property type (status or select)
+        self._status_type = getattr(self._props, 'status_type', 'status')
+
+        # Build bidirectional mappings
+        self._status_to_notion = {
+            TaskStatus.TODO: self._status_map.todo,
+            TaskStatus.IN_PROGRESS: self._status_map.in_progress,
+            TaskStatus.DONE: self._status_map.done,
+            TaskStatus.BLOCKED: self._status_map.blocked,
+        }
+        self._notion_to_status = {v: k for k, v in self._status_to_notion.items()}
+
+        self._priority_to_notion = {
+            TaskPriority.LOW: self._priority_map.low,
+            TaskPriority.MEDIUM: self._priority_map.medium,
+            TaskPriority.HIGH: self._priority_map.high,
+            TaskPriority.URGENT: self._priority_map.urgent,
+        }
+        self._notion_to_priority = {v: k for k, v in self._priority_to_notion.items()}
 
     def _get_headers(self) -> dict:
         """Get API request headers."""
         return {
             "Authorization": f"Bearer {self._api_key}",
-            "Notion-Version": "2022-06-28",
+            "Notion-Version": self._api_version,
             "Content-Type": "application/json",
         }
 
@@ -121,7 +140,8 @@ class NotionTaskRepository:
             Sequence of tasks
         """
         query_filter = self._build_query_filter(filter)
-        sorts = [{"property": "Created", "direction": "descending"}]
+        # Use timestamp sort (works with last_edited_time and created_time properties)
+        sorts = [{"timestamp": "last_edited_time", "direction": "descending"}]
 
         client = await self._get_client()
         try:
@@ -131,9 +151,11 @@ class NotionTaskRepository:
 
             while has_more:
                 body = {
-                    "filter": query_filter,
                     "sorts": sorts,
                 }
+                # Only include filter if not empty
+                if query_filter:
+                    body["filter"] = query_filter
                 if start_cursor:
                     body["start_cursor"] = start_cursor
 
@@ -297,12 +319,13 @@ class NotionTaskRepository:
 
         conditions = []
 
-        # Status filter
+        # Status filter (supports both "status" and "select" property types)
         if filter.status:
+            status_filter_type = self._status_type  # "status" or "select"
             status_conditions = [
                 {
-                    "property": "Status",
-                    "status": {"equals": self.STATUS_TO_NOTION.get(s, "Not started")},
+                    "property": self._props.status,
+                    status_filter_type: {"equals": self._status_to_notion.get(s, self._status_map.todo)},
                 }
                 for s in filter.status
             ]
@@ -315,8 +338,8 @@ class NotionTaskRepository:
         if filter.priority:
             priority_conditions = [
                 {
-                    "property": "Priority",
-                    "select": {"equals": self.PRIORITY_TO_NOTION.get(p, "Medium")},
+                    "property": self._props.priority,
+                    "select": {"equals": self._priority_to_notion.get(p, self._priority_map.medium)},
                 }
                 for p in filter.priority
             ]
@@ -328,13 +351,13 @@ class NotionTaskRepository:
         # Due date filter
         if filter.due_before:
             conditions.append({
-                "property": "Due",
+                "property": self._props.due_date,
                 "date": {"on_or_before": filter.due_before.isoformat()},
             })
 
         if filter.due_after:
             conditions.append({
-                "property": "Due",
+                "property": self._props.due_date,
                 "date": {"on_or_after": filter.due_after.isoformat()},
             })
 
@@ -342,14 +365,14 @@ class NotionTaskRepository:
         if filter.tags:
             for tag in filter.tags:
                 conditions.append({
-                    "property": "Tags",
+                    "property": self._props.tags,
                     "multi_select": {"contains": tag},
                 })
 
         # Assignee filter
         if filter.assignee:
             conditions.append({
-                "property": "Assignee",
+                "property": self._props.assignee,
                 "people": {"contains": filter.assignee},
             })
 
@@ -370,29 +393,36 @@ class NotionTaskRepository:
         Returns:
             Notion properties dict
         """
+        # Build status property based on type (status or select)
+        status_value = self._status_to_notion.get(task.status, self._status_map.todo)
+        if self._status_type == "select":
+            status_prop = {"select": {"name": status_value}}
+        else:
+            status_prop = {"status": {"name": status_value}}
+
         properties = {
-            "Name": {"title": [{"text": {"content": task.title}}]},
-            "Status": {"status": {"name": self.STATUS_TO_NOTION.get(task.status, "Not started")}},
-            "Priority": {"select": {"name": self.PRIORITY_TO_NOTION.get(task.priority, "Medium")}},
+            self._props.title: {"title": [{"text": {"content": task.title}}]},
+            self._props.status: status_prop,
+            self._props.priority: {"select": {"name": self._priority_to_notion.get(task.priority, self._priority_map.medium)}},
         }
 
-        if task.description:
-            properties["Description"] = {
+        if task.description and self._props.description:
+            properties[self._props.description] = {
                 "rich_text": [{"text": {"content": task.description}}]
             }
 
-        if task.due_date:
-            properties["Due"] = {"date": {"start": task.due_date.isoformat()}}
+        if task.due_date and self._props.due_date:
+            properties[self._props.due_date] = {"date": {"start": task.due_date.isoformat()}}
 
-        if task.tags:
-            properties["Tags"] = {
+        if task.tags and self._props.tags:
+            properties[self._props.tags] = {
                 "multi_select": [{"name": tag} for tag in task.tags]
             }
 
-        # Store metadata as JSON in a rich_text property
-        if task.metadata:
+        # Store metadata as JSON in a rich_text property (only if property is configured)
+        if task.metadata and self._props.metadata:
             import json
-            properties["Metadata"] = {
+            properties[self._props.metadata] = {
                 "rich_text": [{"text": {"content": json.dumps(task.metadata)}}]
             }
 
@@ -411,28 +441,30 @@ class NotionTaskRepository:
             properties = page.get("properties", {})
 
             # Extract title
-            title_prop = properties.get("Name", {})
+            title_prop = properties.get(self._props.title, {})
             title_content = title_prop.get("title", [])
             title = title_content[0]["text"]["content"] if title_content else "Untitled"
 
-            # Extract status
-            status_prop = properties.get("Status", {})
-            status_name = status_prop.get("status", {}).get("name", "Not started")
-            status = self.NOTION_TO_STATUS.get(status_name, TaskStatus.TODO)
+            # Extract status (supports both "status" and "select" property types)
+            status_prop = properties.get(self._props.status, {})
+            # Try "status" type first, then "select" type
+            status_data = status_prop.get("status") or status_prop.get("select")
+            status_name = status_data.get("name", self._status_map.todo) if status_data else self._status_map.todo
+            status = self._notion_to_status.get(status_name, TaskStatus.TODO)
 
             # Extract priority
-            priority_prop = properties.get("Priority", {})
+            priority_prop = properties.get(self._props.priority, {})
             priority_select = priority_prop.get("select")
-            priority_name = priority_select.get("name", "Medium") if priority_select else "Medium"
-            priority = self.NOTION_TO_PRIORITY.get(priority_name, TaskPriority.MEDIUM)
+            priority_name = priority_select.get("name", self._priority_map.medium) if priority_select else self._priority_map.medium
+            priority = self._notion_to_priority.get(priority_name, TaskPriority.MEDIUM)
 
             # Extract description
-            description_prop = properties.get("Description", {})
+            description_prop = properties.get(self._props.description, {})
             description_content = description_prop.get("rich_text", [])
             description = description_content[0]["text"]["content"] if description_content else None
 
             # Extract due date
-            due_prop = properties.get("Due", {})
+            due_prop = properties.get(self._props.due_date, {})
             due_date_data = due_prop.get("date")
             due_date = None
             if due_date_data and due_date_data.get("start"):
@@ -444,13 +476,34 @@ class NotionTaskRepository:
                     due_date = datetime.strptime(due_str, "%Y-%m-%d")
 
             # Extract tags
-            tags_prop = properties.get("Tags", {})
+            tags_prop = properties.get(self._props.tags, {})
             tags_data = tags_prop.get("multi_select", [])
             tags = [t["name"] for t in tags_data]
 
+            # Extract assignee (supports people, multi_select, and select types)
+            assignee = None
+            assignees_list = []
+            if self._props.assignee:
+                assignee_prop = properties.get(self._props.assignee, {})
+                # Handle people type
+                people_data = assignee_prop.get("people", [])
+                if people_data:
+                    assignees_list = [p.get("name", "") for p in people_data if p.get("name")]
+                    assignee = assignees_list[0] if assignees_list else None
+                # Handle multi_select type
+                multi_select_data = assignee_prop.get("multi_select", [])
+                if multi_select_data:
+                    assignees_list = [m["name"] for m in multi_select_data]
+                    assignee = assignees_list[0] if assignees_list else None
+                # Handle select type
+                select_data = assignee_prop.get("select")
+                if select_data:
+                    assignee = select_data.get("name")
+                    assignees_list = [assignee] if assignee else []
+
             # Extract metadata
             metadata = {}
-            metadata_prop = properties.get("Metadata", {})
+            metadata_prop = properties.get(self._props.metadata, {})
             metadata_content = metadata_prop.get("rich_text", [])
             if metadata_content:
                 import json
@@ -458,6 +511,10 @@ class NotionTaskRepository:
                     metadata = json.loads(metadata_content[0]["text"]["content"])
                 except json.JSONDecodeError:
                     pass
+
+            # Store assignees list in metadata for sync service
+            if assignees_list:
+                metadata["assignees"] = assignees_list
 
             # Extract timestamps
             created_at = datetime.fromisoformat(
@@ -475,6 +532,7 @@ class NotionTaskRepository:
                 priority=priority,
                 source=self._source,
                 due_date=due_date,
+                assignee=assignee,
                 tags=tags,
                 external_id=page["id"],
                 metadata=metadata,

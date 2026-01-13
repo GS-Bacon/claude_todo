@@ -11,6 +11,10 @@ from ..repositories.memory import InMemoryTaskRepository, InMemoryCacheRepositor
 
 def setup_container():
     """Set up container with default configuration."""
+    from ..config.settings import get_settings
+    from ..repositories.notion import NotionTaskRepository
+    from ..domain.models import TaskSource
+
     container = get_container()
 
     # Check if already configured
@@ -20,10 +24,42 @@ def setup_container():
     except RuntimeError:
         pass
 
-    # Use in-memory repositories for now
-    # In production, you would configure Notion repositories
-    container.configure_task_repository(InMemoryTaskRepository)
-    container.configure_personal_task_repository(InMemoryTaskRepository)
+    settings = get_settings()
+    notion_settings = settings.notion
+
+    # Use Notion repositories if configured, otherwise in-memory
+    if notion_settings.api_key and notion_settings.team_database_id:
+        # Team repository
+        container.configure_task_repository(
+            lambda: NotionTaskRepository(
+                api_key=notion_settings.api_key.get_secret_value(),
+                database_id=notion_settings.team_database_id,
+                source=TaskSource.NOTION_TEAM,
+                property_names=notion_settings.properties,
+                status_mapping=notion_settings.status_mapping,
+                priority_mapping=notion_settings.priority_mapping,
+                api_version=notion_settings.api_version,
+            )
+        )
+    else:
+        container.configure_task_repository(InMemoryTaskRepository)
+
+    if notion_settings.api_key and notion_settings.personal_database_id:
+        # Personal repository
+        container.configure_personal_task_repository(
+            lambda: NotionTaskRepository(
+                api_key=notion_settings.api_key.get_secret_value(),
+                database_id=notion_settings.personal_database_id,
+                source=TaskSource.NOTION_PERSONAL,
+                property_names=notion_settings.personal_properties,
+                status_mapping=notion_settings.status_mapping,
+                priority_mapping=notion_settings.priority_mapping,
+                api_version=notion_settings.api_version,
+            )
+        )
+    else:
+        container.configure_personal_task_repository(InMemoryTaskRepository)
+
     container.configure_cache_repository(InMemoryCacheRepository)
 
 
@@ -344,6 +380,120 @@ def summary():
         click.echo(f"\n⏰ Due today: {due_today}")
     if overdue_count > 0:
         click.echo(f"⚠️ Overdue: {overdue_count}")
+
+
+@cli.command("task-sync")
+@click.option("--dry-run", is_flag=True, help="Show what would be synced without making changes")
+@click.option("--assignee", "-a", help="Override assignee filter")
+@click.option("--tag", "-t", help="Override tag filter")
+def task_sync(dry_run: bool, assignee: Optional[str], tag: Optional[str]):
+    """Sync tasks from Team DB to Personal DB based on rules."""
+    from ..config.settings import get_settings
+    from ..services.sync_service import (
+        TaskSyncService,
+        SyncRule,
+        assignee_filter,
+        tag_filter,
+        combine_filters,
+    )
+
+    settings = get_settings()
+    sync_settings = settings.task_sync
+
+    if not sync_settings.enabled:
+        click.echo("Task sync is disabled. Set TASK_SYNC_ENABLED=true to enable.")
+        return
+
+    container = get_container()
+
+    # Get repositories from container
+    team_repo = container.task_repository
+    personal_repo = container.personal_task_repository
+
+    # Create sync service
+    sync_service = TaskSyncService(
+        source_repo=team_repo,
+        dest_repo=personal_repo,
+        source_db_name="team",
+        dest_db_name="personal",
+    )
+
+    # Build filters from settings or command-line overrides
+    filters = []
+
+    # Assignee filter
+    assignees = [assignee] if assignee else sync_settings.get_assignees()
+    if assignees:
+        assignee_filters = [assignee_filter(a) for a in assignees]
+        if len(assignee_filters) == 1:
+            filters.append(assignee_filters[0])
+        else:
+            filters.append(combine_filters(*assignee_filters, mode="or"))
+
+    # Tag filter
+    tags = [tag] if tag else sync_settings.get_tags()
+    if tags:
+        tag_filters = [tag_filter(t) for t in tags]
+        if len(tag_filters) == 1:
+            filters.append(tag_filters[0])
+        else:
+            filters.append(combine_filters(*tag_filters, mode="or"))
+
+    if not filters:
+        click.echo("No sync filters configured. Set TASK_SYNC_ASSIGNEES or TASK_SYNC_TAGS.")
+        return
+
+    # Combine all filters with AND
+    combined_filter = combine_filters(*filters, mode="and") if len(filters) > 1 else filters[0]
+
+    # Create sync rule
+    from ..domain.models import TaskStatus
+    skip_statuses = [TaskStatus.DONE] if sync_settings.skip_done else []
+
+    rule = SyncRule(
+        name="team_to_personal",
+        source_filter=combined_filter,
+        skip_statuses=skip_statuses,
+        sync_updates=sync_settings.sync_updates,
+        enabled=True,
+    )
+    sync_service.add_rule(rule)
+
+    if dry_run:
+        click.echo("🔍 Dry run mode - showing what would be synced:\n")
+
+        # Fetch source tasks and show matches
+        source_tasks = run_async(team_repo.list_tasks())
+        matching = [t for t in source_tasks if combined_filter(t) and t.status not in skip_statuses]
+
+        if not matching:
+            click.echo("No tasks match the sync criteria.")
+            return
+
+        click.echo(f"Found {len(matching)} task(s) to sync:\n")
+        for task in matching:
+            click.echo(f"  - [{task.id.value[:8]}] {task.title}")
+            click.echo(f"    Status: {task.status.value}, Priority: {task.priority.value}")
+            if task.due_date:
+                click.echo(f"    Due: {task.due_date.strftime('%Y-%m-%d')}")
+            click.echo()
+    else:
+        click.echo("🔄 Starting task sync...\n")
+
+        results = run_async(sync_service.sync())
+
+        for result in results:
+            click.echo(f"Rule: {result.rule_name}")
+            click.echo(f"  ✅ Created: {result.created}")
+            click.echo(f"  🔄 Updated: {result.updated}")
+            click.echo(f"  ⏭️ Skipped: {result.skipped}")
+
+            if result.errors:
+                click.echo(f"  ❌ Errors: {len(result.errors)}")
+                for error in result.errors:
+                    click.echo(f"    - {error}")
+
+        click.echo("\n✅ Task sync completed!")
 
 
 def main():
